@@ -89,12 +89,12 @@ def discover_tv_players():
     print(f"[+] Scan Complete. Found {len(discovered_ips)} active player(s).\n")
     return discovered_ips
 
-def bootstrap_environment():
+def bootstrap_environment(check_apk=True):
     """Ensures all prerequisites (ADB, files) exist before starting."""
     global ADB_CMD
     print("Running system prerequisite checks...")
 
-    if not os.path.exists(APK_PATH):
+    if check_apk and not os.path.exists(APK_PATH):
         print(f"[!] Critical Error: Target APK not found at: {APK_PATH}")
         sys.exit(1)
 
@@ -229,7 +229,7 @@ def get_apk_version_code(apk_path):
 
 def deploy_to_device(ip):
     """Manages the installation lifecycle for a single TV."""
-    target_socket = f"{ip}:5555"
+    target_socket = ip if ":" in ip else f"{ip}:{TARGET_PORT}"
     
     # 1. Connect over LAN
     stdout, stderr = execute_adb_command([ADB_CMD, "connect", target_socket])
@@ -359,28 +359,59 @@ def deploy_to_device(ip):
     execute_adb_command([ADB_CMD, "disconnect", target_socket])
     return ip, status
 
+def is_valid_ip_or_host(ip_str):
+    """Checks if a string is a valid IPv4 address (optionally with a :port)."""
+    base_ip = ip_str.split(':')[0]
+    parts = base_ip.split('.')
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        try:
+            num = int(part)
+            if num < 0 or num > 255:
+                return False
+        except ValueError:
+            return False
+    return True
+
 def main():
-    bootstrap_environment()
+    # 1. Handle help command immediately without requiring system setup or files
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print("Android TV Provisioning Tool")
+        print("Usage:")
+        print("  python prov.py                       # Provision all boxes on the local subnet")
+        print("  python prov.py <IP>                  # Provision/install to a specific IP")
+        print("  python prov.py -i <IP>               # Provision/install to a specific IP")
+        print("  python prov.py --install <IP>        # Provision/install to a specific IP")
+        print("  python prov.py -u <IP>               # Uninstall app from a specific IP")
+        print("  python prov.py --uninstall <IP>      # Uninstall app from a specific IP")
+        sys.exit(0)
+
+    # 2. Determine if APK file check is needed (needed for install, not for uninstall)
+    check_apk = True
+    if len(sys.argv) > 1 and sys.argv[1] in ("-u", "--uninstall"):
+        check_apk = False
+
+    # 3. Bootstrap environment (ADB, permissions, and optionally APK file presence)
+    bootstrap_environment(check_apk=check_apk)
+    
+    tv_ips = []
+    target_ip = None
     
     # Handle command-line arguments for specific actions
     if len(sys.argv) > 1:
         arg = sys.argv[1]
-        if arg in ("-h", "--help"):
-            print("Android TV Provisioning Tool")
-            print("Usage:")
-            print("  python prov.py                       # Provision all boxes on the local subnet")
-            print("  python prov.py -u <IP>               # Uninstall app from a specific IP")
-            print("  python prov.py --uninstall <IP>      # Uninstall app from a specific IP")
-            sys.exit(0)
-            
-        elif arg in ("-u", "--uninstall") and len(sys.argv) > 2:
+        if arg in ("-u", "--uninstall"):
+            if len(sys.argv) < 3:
+                print("[!] Error: Please specify an IP address to uninstall.")
+                sys.exit(1)
             target_ip = sys.argv[2]
             print(f"\n========================================")
             print(f"    UNINSTALLING APP FROM SPECIFIC IP   ")
             print(f"========================================")
             print(f"Target Device: {target_ip}\n")
             
-            target_socket = f"{target_ip}:5555"
+            target_socket = target_ip if ":" in target_ip else f"{target_ip}:{TARGET_PORT}"
             execute_adb_command([ADB_CMD, "start-server"])
             
             # 1. Connect
@@ -429,18 +460,42 @@ def main():
                     print("2. Re-run this uninstall command: python prov.py -u " + target_ip)
                     print("="*60 + "\n")
                 
-            # 4. Disconnect
+            # 5. Disconnect
             execute_adb_command([ADB_CMD, "disconnect", target_socket])
             sys.exit(0)
 
-    # Default flow: Run the network socket scanner
-    tv_ips = discover_tv_players()
+        elif arg in ("-i", "--install"):
+            if len(sys.argv) < 3:
+                print("[!] Error: Please specify an IP address to install.")
+                sys.exit(1)
+            target_ip = sys.argv[2]
+            if not is_valid_ip_or_host(target_ip):
+                print(f"[!] Error: '{target_ip}' is not a valid IP address.")
+                sys.exit(1)
+            tv_ips = [target_ip]
+            
+        elif is_valid_ip_or_host(arg):
+            target_ip = arg
+            tv_ips = [target_ip]
+            
+        else:
+            print(f"[!] Error: Invalid argument or unrecognized command '{arg}'.")
+            print("Use -h or --help for usage details.")
+            sys.exit(1)
+
+    else:
+        # Default flow: Run the network socket scanner
+        tv_ips = discover_tv_players()
         
     if not tv_ips:
-        print("[!] No active Android TV devices responded on port 5555. Aborting deployment.")
+        print("[!] No active Android TV devices to process. Aborting deployment.")
         sys.exit(0)
         
-    print(f"Initializing fleet upgrade across {len(tv_ips)} discovered nodes...\n")
+    if target_ip:
+        print(f"Initializing deployment on target device: {target_ip}...\n")
+    else:
+        print(f"Initializing fleet upgrade across {len(tv_ips)} discovered nodes...\n")
+        
     execute_adb_command([ADB_CMD, "start-server"])
     
     results = {}
