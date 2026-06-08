@@ -343,17 +343,42 @@ def deploy_to_device(ip):
             dpm_err = dpm_stderr.strip() if dpm_stderr else dpm_stdout.strip()
             print(f"  [Device {ip}] Note/Warning on Device Owner setup: {dpm_err}")
 
+        # 4.5 Configure Accessibility Service
+        print(f"  [Device {ip}] Enabling accessibility service: HomeButtonAccessibilityService...")
+        acc_service = f"{PACKAGE_NAME}/{PACKAGE_NAME}.HomeButtonAccessibilityService"
+        get_acc_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "get", "secure", "enabled_accessibility_services"])
+        current_services = get_acc_stdout.strip() if get_acc_stdout else ""
+        if current_services in ("null", "", "invalid"):
+            new_services = acc_service
+        else:
+            services_list = [s.strip() for s in current_services.split(":") if s.strip()]
+            if acc_service not in services_list:
+                services_list.append(acc_service)
+            new_services = ":".join(services_list)
+        
+        execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services])
+        execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "put", "secure", "accessibility_enabled", "1"])
+        
+        # Verify accessibility service enablement
+        verify_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "get", "secure", "enabled_accessibility_services"])
+        verify_services = verify_stdout.strip() if verify_stdout else ""
+        acc_status = "YES" if acc_service in verify_services else "NO"
+        if acc_status == "YES":
+            print(f"  [Device {ip}] Accessibility service successfully enabled.")
+        else:
+            print(f"  [Device {ip}] Warning: Failed to enable accessibility service.")
+
         # 5. Force launch application activity into foreground
         launch_target = f"{PACKAGE_NAME}/{MAIN_ACTIVITY}"
         execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "am", "start", "-n", launch_target])
         
         # Set final detailed status
         if status == "SUCCESS":
-            status = f"SUCCESS (Device Owner: {owner_status})"
+            status = f"SUCCESS (Device Owner: {owner_status}, Accessibility: {acc_status})"
         elif status == "UPGRADED":
-            status = f"UPGRADED (Device Owner: {owner_status})"
+            status = f"UPGRADED (Device Owner: {owner_status}, Accessibility: {acc_status})"
         elif status == "ALREADY_INSTALLED":
-            status = f"ALREADY_INSTALLED (Device Owner: {owner_status})"
+            status = f"ALREADY_INSTALLED (Device Owner: {owner_status}, Accessibility: {acc_status})"
         
     # 6. Tear down network socket
     execute_adb_command([ADB_CMD, "disconnect", target_socket])
@@ -385,11 +410,13 @@ def main():
         print("  python prov.py --install <IP>        # Provision/install to a specific IP")
         print("  python prov.py -u <IP>               # Uninstall app from a specific IP")
         print("  python prov.py --uninstall <IP>      # Uninstall app from a specific IP")
+        print("  python prov.py -a <IP>               # Enable accessibility service on a specific IP")
+        print("  python prov.py --accessibility <IP>  # Enable accessibility service on a specific IP")
         sys.exit(0)
 
-    # 2. Determine if APK file check is needed (needed for install, not for uninstall)
+    # 2. Determine if APK file check is needed (needed for install, not for uninstall/accessibility)
     check_apk = True
-    if len(sys.argv) > 1 and sys.argv[1] in ("-u", "--uninstall"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("-u", "--uninstall", "-a", "--accessibility"):
         check_apk = False
 
     # 3. Bootstrap environment (ADB, permissions, and optionally APK file presence)
@@ -461,6 +488,59 @@ def main():
                     print("="*60 + "\n")
                 
             # 5. Disconnect
+            execute_adb_command([ADB_CMD, "disconnect", target_socket])
+            sys.exit(0)
+
+        elif arg in ("-a", "--accessibility"):
+            if len(sys.argv) < 3:
+                print("[!] Error: Please specify an IP address to enable accessibility.")
+                sys.exit(1)
+            target_ip = sys.argv[2]
+            if not is_valid_ip_or_host(target_ip):
+                print(f"[!] Error: '{target_ip}' is not a valid IP address.")
+                sys.exit(1)
+            print(f"\n========================================")
+            print(f"  ENABLING ACCESSIBILITY ON SPECIFIC IP ")
+            print(f"========================================")
+            print(f"Target Device: {target_ip}\n")
+            
+            target_socket = target_ip if ":" in target_ip else f"{target_ip}:{TARGET_PORT}"
+            execute_adb_command([ADB_CMD, "start-server"])
+            
+            # 1. Connect
+            print(f"[*] Connecting to {target_socket}...")
+            stdout, stderr = execute_adb_command([ADB_CMD, "connect", target_socket])
+            if "connected" not in stdout and "already connected" not in stdout:
+                err_details = stderr.strip() if stderr else stdout.strip()
+                print(f"[!] Connection failed: {err_details}")
+                sys.exit(1)
+                
+            # 2. Configure Accessibility
+            acc_service = f"{PACKAGE_NAME}/{PACKAGE_NAME}.HomeButtonAccessibilityService"
+            print(f"[*] Fetching current enabled accessibility services...")
+            get_acc_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "get", "secure", "enabled_accessibility_services"])
+            current_services = get_acc_stdout.strip() if get_acc_stdout else ""
+            if current_services in ("null", "", "invalid"):
+                new_services = acc_service
+            else:
+                services_list = [s.strip() for s in current_services.split(":") if s.strip()]
+                if acc_service not in services_list:
+                    services_list.append(acc_service)
+                new_services = ":".join(services_list)
+            
+            print(f"[*] Enabling service: {acc_service}...")
+            execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "put", "secure", "enabled_accessibility_services", new_services])
+            execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "put", "secure", "accessibility_enabled", "1"])
+            
+            # Verify
+            verify_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "get", "secure", "enabled_accessibility_services"])
+            verify_services = verify_stdout.strip() if verify_stdout else ""
+            if acc_service in verify_services:
+                print(f"\n[+] SUCCESS: Accessibility service enabled successfully on {target_ip}.")
+            else:
+                print(f"\n[!] WARNING: Failed to enable accessibility service on {target_ip}.")
+                
+            # Disconnect
             execute_adb_command([ADB_CMD, "disconnect", target_socket])
             sys.exit(0)
 
