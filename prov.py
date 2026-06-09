@@ -7,6 +7,10 @@ import urllib.request
 import zipfile
 import platform
 import time
+import threading
+
+VERBOSE = False
+print_lock = threading.Lock()
 
 # ==================== CONFIGURATION ====================
 APK_PATH = r"app-release.apk"         # Assumes APK is in the same folder as the script
@@ -151,14 +155,33 @@ def download_and_extract_adb():
         sys.exit(1)
 
 def execute_adb_command(command, timeout=ADB_TIMEOUT_SECONDS):
+    if VERBOSE:
+        cmd_str = command if isinstance(command, str) else " ".join(command)
+        with print_lock:
+            print(f"[DEBUG] Executing: {cmd_str}")
     try:
         # command can be either a list or a string. If it's a list, we do not use shell=True.
         # If it's a string, we run it using shell=True.
         is_shell = isinstance(command, str)
         process = subprocess.run(command, capture_output=True, text=True, timeout=timeout, shell=is_shell)
+        if VERBOSE:
+            with print_lock:
+                print(f"[DEBUG] Command exited with code: {process.returncode}")
+                if process.stdout:
+                    print(f"[DEBUG] stdout:\n{process.stdout.rstrip()}")
+                if process.stderr:
+                    print(f"[DEBUG] stderr:\n{process.stderr.rstrip()}")
         return process.stdout, process.stderr
     except subprocess.TimeoutExpired:
+        if VERBOSE:
+            with print_lock:
+                print(f"[DEBUG] Command timed out after {timeout} seconds")
         return "", "EXECUTION_TIMEOUT"
+    except Exception as e:
+        if VERBOSE:
+            with print_lock:
+                print(f"[DEBUG] Command failed with exception: {e}")
+        return "", f"ERROR: {e}"
 
 def get_apk_version_code(apk_path):
     """Parses the AndroidManifest.xml binary inside the APK without external dependencies to get versionCode."""
@@ -400,6 +423,18 @@ def is_valid_ip_or_host(ip_str):
     return True
 
 def main():
+    global VERBOSE
+    # Handle verbose flags anywhere in the arguments
+    while "-v" in sys.argv:
+        VERBOSE = True
+        sys.argv.remove("-v")
+    while "--verbose" in sys.argv:
+        VERBOSE = True
+        sys.argv.remove("--verbose")
+
+    if VERBOSE:
+        print("[DEBUG] Verbose logging enabled.")
+
     # 1. Handle help command immediately without requiring system setup or files
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         print("Android TV Provisioning Tool")
@@ -412,6 +447,8 @@ def main():
         print("  python prov.py --uninstall <IP>      # Uninstall app from a specific IP")
         print("  python prov.py -a <IP>               # Enable accessibility service on a specific IP")
         print("  python prov.py --accessibility <IP>  # Enable accessibility service on a specific IP")
+        print("Options:")
+        print("  -v, --verbose                        # Enable verbose / debug logging of ADB commands")
         sys.exit(0)
 
     # 2. Determine if APK file check is needed (needed for install, not for uninstall/accessibility)
