@@ -1,3 +1,12 @@
+1.4
+---
+* Added support to verify Netflix APKs (both single package and split package directories prefixed with 'netflix_') using apksigner.
+* Added support to deploy/install single or split Netflix packages across all subnet nodes or to a specific target IP via `--install-netflix`.
+
+1.3
+---
+* Added scan mode (-s, --scan) to check available boxes on the network and show their device names/models as well as their Netflix installation status and version.
+
 1.2
 ---
 * Verbose support (-v)

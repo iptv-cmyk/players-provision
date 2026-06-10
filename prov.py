@@ -8,6 +8,7 @@ import zipfile
 import platform
 import time
 import threading
+import glob
 
 VERBOSE = False
 print_lock = threading.Lock()
@@ -407,6 +408,333 @@ def deploy_to_device(ip):
     execute_adb_command([ADB_CMD, "disconnect", target_socket])
     return ip, status
 
+def get_device_details(ip):
+    """Retrieves the model/device name and Netflix package details of a player."""
+    target_socket = ip if ":" in ip else f"{ip}:{TARGET_PORT}"
+    
+    # 1. Connect
+    stdout, stderr = execute_adb_command([ADB_CMD, "connect", target_socket])
+    if "connected" not in stdout and "already connected" not in stdout:
+        return None
+        
+    # 2. Get device name/model
+    model_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "getprop", "ro.product.model"])
+    model = model_stdout.strip() if model_stdout else ""
+    
+    name_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "settings", "get", "global", "device_name"])
+    dev_name = name_stdout.strip() if name_stdout else ""
+    if dev_name in ("null", "", "invalid"):
+        dev_name = ""
+        
+    # 3. Get Netflix info
+    nf_pkgs = ["com.netflix.ninja", "com.netflix.mediaclient"]
+    nf_installed_pkg = None
+    for pkg in nf_pkgs:
+        nf_path_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "pm", "path", pkg])
+        if "package:" in nf_path_stdout:
+            nf_installed_pkg = pkg
+            break
+            
+    nf_info = "Not Installed"
+    if nf_installed_pkg:
+        nf_dump_stdout, _ = execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "dumpsys", "package", nf_installed_pkg])
+        version_name = ""
+        version_code = ""
+        for line in nf_dump_stdout.splitlines():
+            line_strip = line.strip()
+            if line_strip.startswith("versionName="):
+                version_name = line_strip.split("=")[1]
+            elif "versionCode=" in line_strip:
+                parts = line_strip.split()
+                for p in parts:
+                    if p.startswith("versionCode="):
+                        version_code = p.split("=")[1]
+        if version_name and version_code:
+            nf_info = f"Installed [{nf_installed_pkg}] (v{version_name}, code {version_code})"
+        elif version_name:
+            nf_info = f"Installed [{nf_installed_pkg}] (v{version_name})"
+        elif version_code:
+            nf_info = f"Installed [{nf_installed_pkg}] (code {version_code})"
+        else:
+            nf_info = f"Installed [{nf_installed_pkg}]"
+            
+    # 4. Disconnect
+    execute_adb_command([ADB_CMD, "disconnect", target_socket])
+    
+    # Compute display name
+    if model and dev_name and model != dev_name:
+        display_name = f"{model} ({dev_name})"
+    elif model:
+        display_name = model
+    elif dev_name:
+        display_name = dev_name
+    else:
+        display_name = "Unknown Device"
+        
+    return display_name, nf_info
+
+def scan_network_for_names():
+    """Sweeps the network for active TV players and displays their names and Netflix information."""
+    tv_ips = discover_tv_players()
+    if not tv_ips:
+        print("[!] No active Android TV devices found on the network.")
+        return
+        
+    print("Retrieving names and Netflix details for discovered devices...")
+    execute_adb_command([ADB_CMD, "start-server"])
+    
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DEPLOY_THREADS) as executor:
+        future_to_ip = {executor.submit(get_device_details, ip): ip for ip in tv_ips}
+        
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                res = future.result()
+                if res:
+                    name, nf_info = res
+                    results[ip] = (name, nf_info)
+                else:
+                    results[ip] = ("Failed to retrieve info", "Check ADB/Authentication")
+            except Exception as exc:
+                results[ip] = ("ERROR", f"Thread Exception: {exc}")
+                
+    print("\n" + "="*80)
+    print("         DISCOVERED DEVICES SUMMARY")
+    print("="*80)
+    for ip in sorted(results.keys(), key=lambda x: list(map(int, x.split('.')))):
+        name, nf_info = results[ip]
+        print(f"IP Target: {ip:<18} Name: {name:<35} Netflix: {nf_info}")
+    print("="*80 + "\n")
+
+def find_java():
+    """Finds the java executable on the host machine."""
+    try:
+        subprocess.run(["java", "-version"], capture_output=True)
+        return "java"
+    except FileNotFoundError:
+        pass
+
+    common_paths = [
+        "/opt/android-studio/jbr/bin/java",
+        "/usr/bin/java",
+        "/usr/local/bin/java",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+
+    import glob
+    for pattern in [
+        "/opt/android-studio/jbr/bin/java",
+        "/usr/lib/jvm/*/bin/java",
+        "/usr/lib/jvm/bin/java",
+    ]:
+        matches = glob.glob(pattern)
+        if matches:
+            return matches[0]
+
+    return None
+
+def find_apksigner():
+    """Finds the apksigner tool on the host machine."""
+    try:
+        subprocess.run(["apksigner", "--version"], capture_output=True)
+        return "apksigner"
+    except FileNotFoundError:
+        pass
+
+    sdk_dirs = []
+    for env_var in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        val = os.environ.get(env_var)
+        if val:
+            sdk_dirs.append(val)
+            
+    home = os.path.expanduser("~")
+    sdk_dirs.append(os.path.join(home, "Android", "Sdk"))
+    sdk_dirs.append(os.path.join(home, "Library", "Android", "sdk"))
+    
+    if platform.system() == "Windows":
+        sdk_dirs.append(os.path.join(os.environ.get("LOCALAPPDATA", ""), "Android", "Sdk"))
+
+    import glob
+    for sdk_dir in sdk_dirs:
+        if os.path.isdir(sdk_dir):
+            build_tools_pattern = os.path.join(sdk_dir, "build-tools", "*", "apksigner")
+            if platform.system() == "Windows":
+                build_tools_pattern += ".bat"
+            matches = glob.glob(build_tools_pattern)
+            if matches:
+                matches.sort(reverse=True)
+                return matches[0]
+
+    return None
+
+def execute_apksigner_command(args):
+    """Runs apksigner with a custom environment including java path if needed."""
+    java_path = find_java()
+    env = os.environ.copy()
+    if java_path:
+        java_dir = os.path.dirname(java_path)
+        env["PATH"] = java_dir + os.path.pathsep + env.get("PATH", "")
+        
+    apksigner_path = find_apksigner()
+    if not apksigner_path:
+        return None, "Error: apksigner tool not found in Android SDK or system PATH."
+        
+    cmd = [apksigner_path] + args
+    try:
+        process = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        return process.stdout, process.stderr
+    except Exception as e:
+        return None, f"Exception: {e}"
+
+def find_netflix_path():
+    """Finds the Netflix path (either a folder or a single APK) starting with netflix_ in the current directory."""
+    cwd = os.getcwd()
+    # Find folders first
+    folders = [os.path.join(cwd, d) for d in os.listdir(cwd) if d.lower().startswith("netflix_") and os.path.isdir(os.path.join(cwd, d))]
+    if folders:
+        return folders[0], True  # path, is_directory
+        
+    # Find files next
+    files = [os.path.join(cwd, f) for f in os.listdir(cwd) if f.lower().startswith("netflix_") and f.lower().endswith(".apk")]
+    if files:
+        return files[0], False  # path, is_directory
+        
+    return None, False
+
+def verify_netflix_apk():
+    """Verifies Netflix APK (either single or split packages) in the netflix_ path."""
+    path, is_dir = find_netflix_path()
+    if not path:
+        print("[!] Error: No Netflix folder or APK starting with 'netflix_' was found in the current directory.")
+        sys.exit(1)
+        
+    if is_dir:
+        apk_files = glob.glob(os.path.join(path, "*.apk"))
+        if not apk_files:
+            print(f"[!] Error: No APK files found inside Netflix split directory: {path}")
+            sys.exit(1)
+            
+        print(f"[*] Found Netflix split directory: {path} with {len(apk_files)} APKs.")
+        for apk_file in sorted(apk_files):
+            print(f"[*] Verifying signature for split: {os.path.basename(apk_file)}...")
+            stdout, stderr = execute_apksigner_command(["verify", "--print-certs", apk_file])
+            
+            print("\n=================== APKSIGNER OUTPUT ===================")
+            if stdout:
+                print(stdout)
+            if stderr:
+                print(stderr)
+            print("========================================================\n")
+    else:
+        print(f"[*] Found Netflix APK: {os.path.basename(path)}")
+        print(f"[*] Verifying signature for {os.path.basename(path)}...")
+        stdout, stderr = execute_apksigner_command(["verify", "--print-certs", path])
+        if stdout is None:
+            print(f"[!] Verification failed: {stderr}")
+            sys.exit(1)
+            
+        print("\n=================== APKSIGNER OUTPUT ===================")
+        if stdout:
+            print(stdout)
+        if stderr:
+            print(stderr)
+        print("========================================================\n")
+
+def deploy_netflix_to_device(ip):
+    """Deploys Netflix splits or single APK to a single device."""
+    target_socket = ip if ":" in ip else f"{ip}:{TARGET_PORT}"
+    
+    # 1. Find Netflix source path (folder or single APK)
+    path, is_dir = find_netflix_path()
+    if not path:
+        return ip, "ERROR: No Netflix folder or APK found"
+        
+    if is_dir:
+        apk_files = glob.glob(os.path.join(path, "*.apk"))
+        if not apk_files:
+            return ip, "ERROR: No split APK files found"
+    else:
+        apk_files = [path]
+        
+    # 2. Connect over LAN
+    stdout, stderr = execute_adb_command([ADB_CMD, "connect", target_socket])
+    if "connected" not in stdout and "already connected" not in stdout:
+        err_details = stderr.strip() if stderr else stdout.strip()
+        return ip, f"CONNECTION_FAILED ({err_details})"
+        
+    # 3. Install
+    if is_dir:
+        print(f"  [Device {ip}] Pushing {len(apk_files)} native split packages from {os.path.basename(path)}...")
+        cmd = [ADB_CMD, "-s", target_socket, "install-multiple", "-r", "-g"] + apk_files
+        inst_stdout, inst_stderr = execute_adb_command(cmd, timeout=90)
+    else:
+        print(f"  [Device {ip}] Pushing single package {os.path.basename(path)}...")
+        temp_apk_path = "/data/local/tmp/netflix_temp.apk"
+        push_stdout, push_stderr = execute_adb_command([ADB_CMD, "-s", target_socket, "push", path, temp_apk_path], timeout=90)
+        if "pushed" in push_stdout or "pushed" in push_stderr or "1 file pushed" in push_stdout or "1 file pushed" in push_stderr:
+            inst_stdout, inst_stderr = execute_adb_command([
+                ADB_CMD, "-s", target_socket, "shell", "pm", "install", "-r", "-g", temp_apk_path
+            ], timeout=60)
+            execute_adb_command([ADB_CMD, "-s", target_socket, "shell", "rm", temp_apk_path])
+        else:
+            inst_stdout = ""
+            inst_stderr = push_stderr.strip() if push_stderr else push_stdout.strip()
+            if not inst_stderr:
+                inst_stderr = "Push failed"
+                
+    # 4. Disconnect
+    execute_adb_command([ADB_CMD, "disconnect", target_socket])
+    
+    if "Success" in inst_stdout:
+        return ip, "SUCCESS"
+    else:
+        error_details = inst_stderr.strip() if inst_stderr else inst_stdout.strip()
+        if not error_details:
+            error_details = "Installation failed (unknown error)"
+        return ip, f"INSTALL_FAILED ({error_details})"
+
+def install_netflix_workflow(target_ip=None):
+    """Coordinates the installation of Netflix splits/APK to target device(s)."""
+    path, is_dir = find_netflix_path()
+    if not path:
+        print("[!] Error: No Netflix folder or APK starting with 'netflix_' was found in the current directory.")
+        sys.exit(1)
+        
+    if target_ip:
+        tv_ips = [target_ip]
+        print(f"Initializing Netflix installation on target device: {target_ip}...\n")
+    else:
+        tv_ips = discover_tv_players()
+        if not tv_ips:
+            print("[!] No active Android TV devices to process. Aborting installation.")
+            sys.exit(0)
+        print(f"Initializing Netflix installation across {len(tv_ips)} discovered nodes...\n")
+        
+    execute_adb_command([ADB_CMD, "start-server"])
+    
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DEPLOY_THREADS) as executor:
+        future_to_ip = {executor.submit(deploy_netflix_to_device, ip): ip for ip in tv_ips}
+        
+        for future in concurrent.futures.as_completed(future_to_ip):
+            ip = future_to_ip[future]
+            try:
+                device_ip, device_status = future.result()
+                results[device_ip] = device_status
+                print(f"[Device {device_ip}] -> {device_status}")
+            except Exception as exc:
+                results[ip] = f"THREAD_EXC ({exc})"
+                print(f"[Device {ip}] -> THREAD ERROR")
+                
+    print("\n" + "="*40)
+    print("      NETFLIX INSTALLATION FINAL SUMMARY")
+    print("="*40)
+    for ip, status in results.items():
+        print(f"Room Target: {ip:<18} Status: {status}")
+
 def is_valid_ip_or_host(ip_str):
     """Checks if a string is a valid IPv4 address (optionally with a :port)."""
     base_ip = ip_str.split(':')[0]
@@ -447,13 +775,17 @@ def main():
         print("  python prov.py --uninstall <IP>      # Uninstall app from a specific IP")
         print("  python prov.py -a <IP>               # Enable accessibility service on a specific IP")
         print("  python prov.py --accessibility <IP>  # Enable accessibility service on a specific IP")
+        print("  python prov.py -s, --scan            # Scan the network for active boxes and print their names")
+        print("  python prov.py --verify-netflix      # Verify the signing certificate of the Netflix APK starting with netflix_")
+        print("  python prov.py --install-netflix     # Install Netflix (splits or APK) to all boxes on the local subnet")
+        print("  python prov.py --install-netflix <IP># Install Netflix (splits or APK) to a specific IP")
         print("Options:")
         print("  -v, --verbose                        # Enable verbose / debug logging of ADB commands")
         sys.exit(0)
 
-    # 2. Determine if APK file check is needed (needed for install, not for uninstall/accessibility)
+    # 2. Determine if APK file check is needed (needed for install, not for uninstall/accessibility/scan/verify-netflix/install-netflix)
     check_apk = True
-    if len(sys.argv) > 1 and sys.argv[1] in ("-u", "--uninstall", "-a", "--accessibility"):
+    if len(sys.argv) > 1 and sys.argv[1] in ("-u", "--uninstall", "-a", "--accessibility", "-s", "--scan", "--verify-netflix", "--install-netflix"):
         check_apk = False
 
     # 3. Bootstrap environment (ADB, permissions, and optionally APK file presence)
@@ -579,6 +911,33 @@ def main():
                 
             # Disconnect
             execute_adb_command([ADB_CMD, "disconnect", target_socket])
+            sys.exit(0)
+
+        elif arg in ("-s", "--scan"):
+            print(f"\n========================================")
+            print(f"      SCANNING NETWORK FOR ACTIVE BOXES ")
+            print(f"========================================")
+            scan_network_for_names()
+            sys.exit(0)
+
+        elif arg == "--verify-netflix":
+            print(f"\n========================================")
+            print(f"      VERIFYING NETFLIX APK SIGNATURE   ")
+            print(f"========================================")
+            verify_netflix_apk()
+            sys.exit(0)
+
+        elif arg == "--install-netflix":
+            target_ip = None
+            if len(sys.argv) > 2:
+                target_ip = sys.argv[2]
+                if not is_valid_ip_or_host(target_ip):
+                    print(f"[!] Error: '{target_ip}' is not a valid IP address.")
+                    sys.exit(1)
+            print(f"\n========================================")
+            print(f"      INSTALLING NETFLIX APK/SPLITS     ")
+            print(f"========================================")
+            install_netflix_workflow(target_ip)
             sys.exit(0)
 
         elif arg in ("-i", "--install"):
